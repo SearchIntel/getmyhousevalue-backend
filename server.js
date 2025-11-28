@@ -27,12 +27,19 @@ app.get('/api/properties', async (req, res) => {
   
   if (!postcode) return res.status(400).json({ error: "Postcode required" });
 
-  const cleanPostcode = postcode.toUpperCase().replace(/\s/g, '');
-  console.log(`Searching for: ${cleanPostcode}`);
+  // Clean the postcode (e.g. "GU25 4DG")
+  const cleanPostcode = postcode.toUpperCase().replace(/\s+/g, ' ').trim(); 
+  // Create a "sector" version for fallback (e.g. "GU25 4")
+  const postcodeSector = cleanPostcode.split(' ').length > 1 
+      ? cleanPostcode.substring(0, cleanPostcode.length - 2).trim() 
+      : cleanPostcode;
+
+  console.log(`Searching for: ${cleanPostcode} (Sector: ${postcodeSector})`);
 
   try {
     // 1. Fetch Sold Data (Land Registry)
-    const sparqlQuery = `
+    // We try EXACT match first. If that fails, we try SECTOR match.
+    let sparqlQuery = `
       prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
       prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>
       prefix xsd: <http://www.w3.org/2001/XMLSchema#>
@@ -45,27 +52,57 @@ app.get('/api/properties', async (req, res) => {
                 lrppi:propertyType ?typeRef ;
                 lrppi:propertyAddress ?addr .
         ?typeRef rdfs:label ?type .
-        ?addr lrcommon:postcode "${cleanPostcode}"^^xsd:string .
+        ?addr lrcommon:postcode "${cleanPostcode.replace(/\s/g, '')}"^^xsd:string .
         OPTIONAL { ?addr lrcommon:paon ?paon }
         OPTIONAL { ?addr lrcommon:saon ?saon }
         OPTIONAL { ?addr lrcommon:street ?street }
       } ORDER BY DESC(?date) LIMIT 50
     `;
 
-    const landRegUrl = `https://landregistry.data.gov.uk/landregistry/query?query=${encodeURIComponent(sparqlQuery)}&output=json`;
-    const landRegResponse = await axios.get(landRegUrl);
-    
-    // Check if Land Registry returned anything
-    const sales = landRegResponse.data.results.bindings;
+    let landRegUrl = `https://landregistry.data.gov.uk/landregistry/query?query=${encodeURIComponent(sparqlQuery)}&output=json`;
+    let landRegResponse = await axios.get(landRegUrl);
+    let sales = landRegResponse.data.results.bindings;
+
+    // --- FALLBACK LOGIC ---
+    if (sales.length === 0) {
+        console.log("No exact match found. Trying fallback search...");
+        // Fallback: Search by street/sector (broader search)
+        // Note: We use a REGEX filter for the postcode which is slower but more flexible
+        sparqlQuery = `
+          prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+          prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+          prefix xsd: <http://www.w3.org/2001/XMLSchema#>
+          prefix lrppi: <http://landregistry.data.gov.uk/def/ppi/>
+          prefix lrcommon: <http://landregistry.data.gov.uk/def/common/>
+
+          SELECT ?date ?price ?paon ?saon ?street ?type ?postcode WHERE {
+            ?transx lrppi:pricePaid ?price ;
+                    lrppi:transactionDate ?date ;
+                    lrppi:propertyType ?typeRef ;
+                    lrppi:propertyAddress ?addr .
+            ?typeRef rdfs:label ?type .
+            ?addr lrcommon:postcode ?postcode .
+            FILTER(REGEX(?postcode, "^${postcodeSector.replace(/\s/g, '')}", "i"))
+            OPTIONAL { ?addr lrcommon:paon ?paon }
+            OPTIONAL { ?addr lrcommon:saon ?saon }
+            OPTIONAL { ?addr lrcommon:street ?street }
+          } ORDER BY DESC(?date) LIMIT 20
+        `;
+        landRegUrl = `https://landregistry.data.gov.uk/landregistry/query?query=${encodeURIComponent(sparqlQuery)}&output=json`;
+        landRegResponse = await axios.get(landRegUrl);
+        sales = landRegResponse.data.results.bindings;
+    }
+
     console.log(`Land Registry found ${sales.length} records.`);
 
-    // 2. Fetch EPC Data (Sq Meters) - "Fail Safe" mode
+    // 2. Fetch EPC Data (Sq Meters)
     let epcData = [];
     const authHeader = getAuthHeader();
     
     if (authHeader) {
         try {
-            const epcUrl = `https://epc.opendatacommunities.org/api/v1/domestic/search?postcode=${cleanPostcode}`;
+            // We search EPC by the exact postcode first
+            const epcUrl = `https://epc.opendatacommunities.org/api/v1/domestic/search?postcode=${cleanPostcode.replace(/\s/g, '')}`;
             const epcRes = await axios.get(epcUrl, {
                 headers: { 
                     'Authorization': authHeader,
@@ -75,9 +112,7 @@ app.get('/api/properties', async (req, res) => {
             epcData = epcRes.data.rows || [];
             console.log(`EPC API found ${epcData.length} records.`);
         } catch (err) {
-            // Log the specific error status to help debugging
             console.log(`EPC Fetch Warning: ${err.response ? err.response.status : err.message}`);
-            // Do NOT crash. Just continue with empty EPC data.
         }
     }
 
@@ -88,7 +123,6 @@ app.get('/api/properties', async (req, res) => {
        const street = sale.street ? sale.street.value : '';
        const addressString = `${saon} ${paon} ${street}`.trim();
        
-       // Fuzzy match logic
        const match = epcData.find(e => 
            (e['address'] && e['address'].includes(paon)) || 
            (e['address1'] && e['address1'].includes(paon))
@@ -98,7 +132,7 @@ app.get('/api/properties', async (req, res) => {
          id: `prop_${index}_${Date.now()}`,
          address: addressString || "Unknown Address",
          city: "London", 
-         postcode: postcode.toUpperCase(),
+         postcode: sale.postcode ? sale.postcode.value : cleanPostcode, // Use actual postcode if found in fallback
          type: sale.type.value,
          lastSoldPrice: parseInt(sale.price.value),
          lastSoldDate: sale.date.value,
@@ -111,7 +145,6 @@ app.get('/api/properties', async (req, res) => {
 
   } catch (error) {
     console.error("Critical Server Error:", error.message);
-    // Return empty array instead of 500 error so frontend handles it gracefully
     res.json([]);
   }
 });
