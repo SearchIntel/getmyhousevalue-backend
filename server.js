@@ -6,11 +6,15 @@ const app = express();
 app.use(cors());
 
 // --- CONFIGURATION ---
-// We will set these in the Render dashboard so they stay secret!
 const EPC_USER = process.env.EPC_USER; 
 const EPC_KEY = process.env.EPC_KEY;
 
-// Helper to encode your credentials for the Government API
+// Debug logging (Masked for safety)
+console.log("Starting Server...");
+if (EPC_USER) console.log(`EPC User loaded: ${EPC_USER}`);
+if (EPC_KEY) console.log(`EPC Key loaded: ${EPC_KEY.substring(0, 4)}...`);
+
+// Helper to encode credentials
 const getAuthHeader = () => {
     if (!EPC_USER || !EPC_KEY) return null;
     const str = `${EPC_USER}:${EPC_KEY}`;
@@ -23,11 +27,11 @@ app.get('/api/properties', async (req, res) => {
   
   if (!postcode) return res.status(400).json({ error: "Postcode required" });
 
-  console.log(`Searching for: ${postcode}`);
+  const cleanPostcode = postcode.toUpperCase().replace(/\s/g, '');
+  console.log(`Searching for: ${cleanPostcode}`);
 
   try {
-    // 1. Fetch Sold Data from Land Registry (Open Data - SPARQL)
-    // We fetch the top 50 most recent sales in that postcode
+    // 1. Fetch Sold Data (Land Registry)
     const sparqlQuery = `
       prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
       prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -41,7 +45,7 @@ app.get('/api/properties', async (req, res) => {
                 lrppi:propertyType ?typeRef ;
                 lrppi:propertyAddress ?addr .
         ?typeRef rdfs:label ?type .
-        ?addr lrcommon:postcode "${postcode.toUpperCase().replace(/\s/g, '')}"^^xsd:string .
+        ?addr lrcommon:postcode "${cleanPostcode}"^^xsd:string .
         OPTIONAL { ?addr lrcommon:paon ?paon }
         OPTIONAL { ?addr lrcommon:saon ?saon }
         OPTIONAL { ?addr lrcommon:street ?street }
@@ -50,15 +54,18 @@ app.get('/api/properties', async (req, res) => {
 
     const landRegUrl = `https://landregistry.data.gov.uk/landregistry/query?query=${encodeURIComponent(sparqlQuery)}&output=json`;
     const landRegResponse = await axios.get(landRegUrl);
+    
+    // Check if Land Registry returned anything
     const sales = landRegResponse.data.results.bindings;
+    console.log(`Land Registry found ${sales.length} records.`);
 
-    // 2. Fetch EPC Data (To get sq meters)
+    // 2. Fetch EPC Data (Sq Meters) - "Fail Safe" mode
     let epcData = [];
     const authHeader = getAuthHeader();
     
     if (authHeader) {
         try {
-            const epcUrl = `https://epc.opendatacommunities.org/api/v1/domestic/search?postcode=${postcode.replace(/\s/g, '')}`;
+            const epcUrl = `https://epc.opendatacommunities.org/api/v1/domestic/search?postcode=${cleanPostcode}`;
             const epcRes = await axios.get(epcUrl, {
                 headers: { 
                     'Authorization': authHeader,
@@ -66,11 +73,12 @@ app.get('/api/properties', async (req, res) => {
                 }
             });
             epcData = epcRes.data.rows || [];
+            console.log(`EPC API found ${epcData.length} records.`);
         } catch (err) {
-            console.log("EPC Fetch Failed (Check API Key):", err.message);
+            // Log the specific error status to help debugging
+            console.log(`EPC Fetch Warning: ${err.response ? err.response.status : err.message}`);
+            // Do NOT crash. Just continue with empty EPC data.
         }
-    } else {
-        console.log("Skipping EPC fetch: No credentials provided.");
     }
 
     // 3. Merge Data
@@ -80,18 +88,21 @@ app.get('/api/properties', async (req, res) => {
        const street = sale.street ? sale.street.value : '';
        const addressString = `${saon} ${paon} ${street}`.trim();
        
-       // Try to find matching EPC data for square meters
-       const match = epcData.find(e => e['address'].includes(paon) || e['address1'].includes(paon));
+       // Fuzzy match logic
+       const match = epcData.find(e => 
+           (e['address'] && e['address'].includes(paon)) || 
+           (e['address1'] && e['address1'].includes(paon))
+       );
        
        return {
          id: `prop_${index}_${Date.now()}`,
          address: addressString || "Unknown Address",
-         city: "London", // In a full app, we'd fetch the city too
+         city: "London", 
          postcode: postcode.toUpperCase(),
          type: sale.type.value,
          lastSoldPrice: parseInt(sale.price.value),
          lastSoldDate: sale.date.value,
-         sqMeters: match ? parseInt(match['total-floor-area']) : 90, // Default to 90 if no EPC found
+         sqMeters: match ? parseInt(match['total-floor-area']) : 90, 
          epc: match ? match['current-energy-rating'] : 'N/A'
        };
     });
@@ -99,8 +110,9 @@ app.get('/api/properties', async (req, res) => {
     res.json(results);
 
   } catch (error) {
-    console.error("Server Error:", error.message);
-    res.status(500).json({ error: "Failed to fetch property data" });
+    console.error("Critical Server Error:", error.message);
+    // Return empty array instead of 500 error so frontend handles it gracefully
+    res.json([]);
   }
 });
 
