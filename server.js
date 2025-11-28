@@ -22,13 +22,12 @@ app.get('/api/properties', async (req, res) => {
   
   if (!postcode) return res.status(400).json({ error: "Postcode required" });
 
-  // Ensure postcode has the correct space (e.g. "KT4 7DY")
   const cleanPostcode = postcode.toUpperCase().replace(/\s+/g, ' ').trim(); 
   console.log(`Searching for: ${cleanPostcode}`);
 
   try {
-    // 1. Fetch Land Registry Data
-    // FIX: Use the postcode WITH the space, as Land Registry expects strict formatting.
+    // 1. Fetch Land Registry Data (Exact Match Only)
+    // We stick to exact match to avoid long timeouts
     let sales = [];
     try {
         let sparqlQuery = `
@@ -54,7 +53,7 @@ app.get('/api/properties', async (req, res) => {
         let landRegResponse = await axios.get(landRegUrl, { timeout: 8000 });
         sales = landRegResponse.data.results.bindings;
     } catch (err) {
-        console.log("Land Registry fetch failed/timed out. Continuing...");
+        console.log("Land Registry fetch failed/timed out.");
     }
 
     console.log(`Land Registry found ${sales.length} records.`);
@@ -64,7 +63,7 @@ app.get('/api/properties', async (req, res) => {
     const authHeader = getAuthHeader();
     if (authHeader) {
         try {
-            // EPC API handles spaces fine, but we stick to clean version
+            // Remove space for EPC API as it is more robust that way usually
             const epcUrl = `https://epc.opendatacommunities.org/api/v1/domestic/search?postcode=${cleanPostcode.replace(/\s/g, '')}`;
             const epcRes = await axios.get(epcUrl, {
                 headers: { 'Authorization': authHeader, 'Accept': 'application/json' },
@@ -81,14 +80,13 @@ app.get('/api/properties', async (req, res) => {
     let results = [];
 
     if (sales.length > 0) {
-        // Option A: We have sales data (This is what we want!)
+        // Option A: Real Sales Data
         results = sales.map((sale, index) => {
            const paon = sale.paon ? sale.paon.value : '';
            const saon = sale.saon ? sale.saon.value : '';
            const street = sale.street ? sale.street.value : '';
            const addressString = `${saon} ${paon} ${street}`.trim();
            
-           // Match with EPC to get size
            const match = epcData.find(e => 
                (e['address'] && e['address'].includes(paon)) || 
                (e['address1'] && e['address1'].includes(paon))
@@ -107,7 +105,8 @@ app.get('/api/properties', async (req, res) => {
            };
         });
     } else if (epcData.length > 0) {
-        // Option B: Fallback (EPC only, no price)
+        // Option B: Fallback (EPC only)
+        // We set a "null" sold date so the frontend knows to treat it differently
         console.log("Using EPC data as fallback...");
         results = epcData.map((prop, index) => ({
              id: `epc_${index}_${Date.now()}`,
@@ -116,7 +115,7 @@ app.get('/api/properties', async (req, res) => {
              postcode: cleanPostcode,
              type: prop['property-type'] || "Unknown",
              lastSoldPrice: 0, 
-             lastSoldDate: "1900-01-01",
+             lastSoldDate: null, // Send NULL instead of a fake date
              sqMeters: parseInt(prop['total-floor-area']),
              epc: prop['current-energy-rating']
         }));
