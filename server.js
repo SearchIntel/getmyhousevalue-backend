@@ -9,14 +9,12 @@ app.use(cors());
 const EPC_USER = process.env.EPC_USER; 
 const EPC_KEY = process.env.EPC_KEY;
 
-// Helper to encode credentials
 const getAuthHeader = () => {
     if (!EPC_USER || !EPC_KEY) return null;
     const str = `${EPC_USER}:${EPC_KEY}`;
     return `Basic ${Buffer.from(str).toString('base64')}`;
 };
 
-// --- ROUTE: GET PROPERTIES ---
 app.get('/api/properties', async (req, res) => {
   const { postcode } = req.query;
   
@@ -26,61 +24,65 @@ app.get('/api/properties', async (req, res) => {
   console.log(`Searching for: ${cleanPostcode}`);
 
   try {
-    // 1. Fetch Land Registry Data (Exact Match Only)
-    // We stick to exact match to avoid long timeouts
-    let sales = [];
-    try {
-        let sparqlQuery = `
-          prefix lrcommon: <http://landregistry.data.gov.uk/def/common/>
-          prefix lrppi: <http://landregistry.data.gov.uk/def/ppi/>
-          prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-          prefix xsd: <http://www.w3.org/2001/XMLSchema#>
-
-          SELECT ?date ?price ?paon ?saon ?street ?type WHERE {
-            ?transx lrppi:pricePaid ?price ;
-                    lrppi:transactionDate ?date ;
-                    lrppi:propertyType ?typeRef ;
-                    lrppi:propertyAddress ?addr .
-            ?typeRef rdfs:label ?type .
-            ?addr lrcommon:postcode "${cleanPostcode}"^^xsd:string .
-            OPTIONAL { ?addr lrcommon:paon ?paon }
-            OPTIONAL { ?addr lrcommon:saon ?saon }
-            OPTIONAL { ?addr lrcommon:street ?street }
-          } ORDER BY DESC(?date) LIMIT 50
-        `;
-
-        let landRegUrl = `https://landregistry.data.gov.uk/landregistry/query?query=${encodeURIComponent(sparqlQuery)}&output=json`;
-        let landRegResponse = await axios.get(landRegUrl, { timeout: 8000 });
-        sales = landRegResponse.data.results.bindings;
-    } catch (err) {
-        console.log("Land Registry fetch failed/timed out.");
-    }
-
-    console.log(`Land Registry found ${sales.length} records.`);
-
-    // 2. Fetch EPC Data
-    let epcData = [];
-    const authHeader = getAuthHeader();
-    if (authHeader) {
+    // START PARALLEL REQUESTS
+    // We launch both searches at the same time to save seconds.
+    
+    // 1. Land Registry Query Promise
+    const landRegPromise = (async () => {
         try {
-            // Remove space for EPC API as it is more robust that way usually
-            const epcUrl = `https://epc.opendatacommunities.org/api/v1/domestic/search?postcode=${cleanPostcode.replace(/\s/g, '')}`;
-            const epcRes = await axios.get(epcUrl, {
-                headers: { 'Authorization': authHeader, 'Accept': 'application/json' },
+            let sparqlQuery = `
+              prefix lrcommon: <http://landregistry.data.gov.uk/def/common/>
+              prefix lrppi: <http://landregistry.data.gov.uk/def/ppi/>
+              prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+              prefix xsd: <http://www.w3.org/2001/XMLSchema#>
+
+              SELECT ?date ?price ?paon ?saon ?street ?type WHERE {
+                ?transx lrppi:pricePaid ?price ;
+                        lrppi:transactionDate ?date ;
+                        lrppi:propertyType ?typeRef ;
+                        lrppi:propertyAddress ?addr .
+                ?typeRef rdfs:label ?type .
+                ?addr lrcommon:postcode "${cleanPostcode}"^^xsd:string .
+                OPTIONAL { ?addr lrcommon:paon ?paon }
+                OPTIONAL { ?addr lrcommon:saon ?saon }
+                OPTIONAL { ?addr lrcommon:street ?street }
+              } ORDER BY DESC(?date) LIMIT 50
+            `;
+            let url = `https://landregistry.data.gov.uk/landregistry/query?query=${encodeURIComponent(sparqlQuery)}&output=json`;
+            let response = await axios.get(url, { timeout: 6000 });
+            return response.data.results.bindings;
+        } catch (e) {
+            console.log("Land Registry Error/Timeout");
+            return [];
+        }
+    })();
+
+    // 2. EPC Query Promise
+    const epcPromise = (async () => {
+        let auth = getAuthHeader();
+        if (!auth) return [];
+        try {
+            let url = `https://epc.opendatacommunities.org/api/v1/domestic/search?postcode=${cleanPostcode.replace(/\s/g, '')}`;
+            let response = await axios.get(url, {
+                headers: { 'Authorization': auth, 'Accept': 'application/json' },
                 timeout: 3000
             });
-            epcData = epcRes.data.rows || [];
-            console.log(`EPC API found ${epcData.length} records.`);
-        } catch (err) {
-            console.log("EPC Fetch skipped/failed.");
+            return response.data.rows || [];
+        } catch (e) {
+            console.log("EPC Error/Timeout");
+            return [];
         }
-    }
+    })();
 
-    // 3. Format Data
+    // WAIT FOR BOTH TO FINISH
+    const [sales, epcData] = await Promise.all([landRegPromise, epcPromise]);
+
+    console.log(`Results: ${sales.length} sales, ${epcData.length} EPC records.`);
+
+    // 3. Merge & Reply
     let results = [];
 
     if (sales.length > 0) {
-        // Option A: Real Sales Data
         results = sales.map((sale, index) => {
            const paon = sale.paon ? sale.paon.value : '';
            const saon = sale.saon ? sale.saon.value : '';
@@ -105,9 +107,6 @@ app.get('/api/properties', async (req, res) => {
            };
         });
     } else if (epcData.length > 0) {
-        // Option B: Fallback (EPC only)
-        // We set a "null" sold date so the frontend knows to treat it differently
-        console.log("Using EPC data as fallback...");
         results = epcData.map((prop, index) => ({
              id: `epc_${index}_${Date.now()}`,
              address: prop.address,
@@ -115,7 +114,7 @@ app.get('/api/properties', async (req, res) => {
              postcode: cleanPostcode,
              type: prop['property-type'] || "Unknown",
              lastSoldPrice: 0, 
-             lastSoldDate: null, // Send NULL instead of a fake date
+             lastSoldDate: null, 
              sqMeters: parseInt(prop['total-floor-area']),
              epc: prop['current-energy-rating']
         }));
@@ -124,7 +123,7 @@ app.get('/api/properties', async (req, res) => {
     res.json(results);
 
   } catch (error) {
-    console.error("Backend Error:", error.message);
+    console.error("Backend Critical Error:", error.message);
     res.json([]); 
   }
 });
